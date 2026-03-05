@@ -127,6 +127,30 @@ def parse_args():
         action="store_true",
         help="Save state/memory statistics plots and arrays",
     )
+    parser.add_argument(
+        "--alias",
+        type=str,
+        default="",
+        help="Alias used for naming saved stats outputs",
+    )
+    parser.add_argument(
+        "--pca",
+        action="store_true",
+        help="Compute PCA90 component counts for state tokens and LocalMemory",
+    )
+    parser.add_argument(
+        "--single_state_token_idx",
+        type=int,
+        default=0,
+        help="State token index for single-token statistic tracking",
+    )
+    parser.add_argument(
+        "--single_state_stat",
+        type=str,
+        default="std",
+        choices=["std", "l1", "l2"],
+        help="Statistic to track for a single state token",
+    )
     return parser.parse_args()
 
 
@@ -443,8 +467,8 @@ def compute_state_stats_series(state_args):
             l2_values.append(float("nan"))
             continue
         std_values.append(torch.std(flat, unbiased=False).item())
-        l1_values.append(torch.norm(flat, p=1).item())
-        l2_values.append(torch.norm(flat, p=2).item())
+        l1_values.append(torch.mean(torch.abs(flat)).item())
+        l2_values.append(torch.sqrt(torch.mean(flat * flat)).item())
     return (
         np.array(std_values, dtype=np.float32),
         np.array(l1_values, dtype=np.float32),
@@ -456,22 +480,117 @@ def compute_mem_stats_series(state_args):
     std_values = []
     l1_values = []
     l2_values = []
+    front_std_values = []
+    front_l1_values = []
+    front_l2_values = []
+    back_std_values = []
+    back_l1_values = []
+    back_l2_values = []
     for state_arg in state_args:
         mem = state_arg[3]
         flat = mem.detach().float().reshape(-1)
+        last_dim = mem.shape[-1]
+        half = last_dim // 2
+        front_flat = mem[..., :half].detach().float().reshape(-1)
+        back_flat = mem[..., half:].detach().float().reshape(-1)
         if flat.numel() == 0:
             std_values.append(float("nan"))
             l1_values.append(float("nan"))
             l2_values.append(float("nan"))
+            front_std_values.append(float("nan"))
+            front_l1_values.append(float("nan"))
+            front_l2_values.append(float("nan"))
+            back_std_values.append(float("nan"))
+            back_l1_values.append(float("nan"))
+            back_l2_values.append(float("nan"))
             continue
         std_values.append(torch.std(flat, unbiased=False).item())
         l1_values.append(torch.norm(flat, p=1).item())
         l2_values.append(torch.norm(flat, p=2).item())
+        if front_flat.numel() == 0:
+            front_std_values.append(float("nan"))
+            front_l1_values.append(float("nan"))
+            front_l2_values.append(float("nan"))
+        else:
+            front_std_values.append(torch.std(front_flat, unbiased=False).item())
+            front_l1_values.append(torch.mean(torch.abs(front_flat)).item())
+            front_l2_values.append(torch.sqrt(torch.mean(front_flat * front_flat)).item())
+        if back_flat.numel() == 0:
+            back_std_values.append(float("nan"))
+            back_l1_values.append(float("nan"))
+            back_l2_values.append(float("nan"))
+        else:
+            back_std_values.append(torch.std(back_flat, unbiased=False).item())
+            back_l1_values.append(torch.mean(torch.abs(back_flat)).item())
+            back_l2_values.append(torch.sqrt(torch.mean(back_flat * back_flat)).item())
     return (
         np.array(std_values, dtype=np.float32),
         np.array(l1_values, dtype=np.float32),
         np.array(l2_values, dtype=np.float32),
+        np.array(front_std_values, dtype=np.float32),
+        np.array(front_l1_values, dtype=np.float32),
+        np.array(front_l2_values, dtype=np.float32),
+        np.array(back_std_values, dtype=np.float32),
+        np.array(back_l1_values, dtype=np.float32),
+        np.array(back_l2_values, dtype=np.float32),
     )
+
+
+def compute_single_state_token_series(state_args, token_idx, stat):
+    series = []
+    for state_arg in state_args:
+        state_feat = state_arg[0]
+        if state_feat.ndim < 3 or token_idx < 0 or token_idx >= state_feat.shape[1]:
+            series.append(float("nan"))
+            continue
+        token_vec = state_feat[0, token_idx].detach().float().reshape(-1)
+        if token_vec.numel() == 0:
+            series.append(float("nan"))
+            continue
+        if stat == "std":
+            series.append(torch.std(token_vec, unbiased=False).item())
+        elif stat == "l1":
+            series.append(torch.mean(torch.abs(token_vec)).item())
+        elif stat == "l2":
+            series.append(torch.sqrt(torch.mean(token_vec * token_vec)).item())
+        else:
+            series.append(float("nan"))
+    return np.array(series, dtype=np.float32)
+
+
+def _svdvals(x):
+    try:
+        return torch.linalg.svdvals(x)
+    except AttributeError:
+        return torch.linalg.svd(x, full_matrices=False)[1]
+
+
+def compute_pca90_components_series(state_args, tensor_index):
+    counts = []
+    for state_arg in state_args:
+        tensor = state_arg[tensor_index]
+        if tensor is None or tensor.numel() == 0:
+            counts.append(float("nan"))
+            continue
+        x = tensor.detach().float().reshape(-1, tensor.shape[-1])
+        if x.shape[0] < 2 or x.shape[1] < 1:
+            counts.append(float("nan"))
+            continue
+        x = x - x.mean(dim=0, keepdim=True)
+        x = x.cpu()
+        s = _svdvals(x)
+        if x.shape[0] <= 1:
+            counts.append(float("nan"))
+            continue
+        var = (s**2) / (x.shape[0] - 1)
+        total = var.sum()
+        if total <= 0:
+            counts.append(float("nan"))
+            continue
+        cum = torch.cumsum(var, 0) / total
+        k = int((cum < 0.9).sum().item()) + 1
+        counts.append(k)
+    return np.array(counts, dtype=np.float32)
 
 
 def save_state_plot(values, plot_path, seq_id, title_suffix, y_label):
@@ -553,31 +672,36 @@ def run_inference(args):
 
     seq = Path(args.seq_path)
     seq_id = seq.stem if seq.suffix else seq.name
+    base_id = args.alias.strip() if args.alias else seq_id
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_id = f"{base_id}_{timestamp}"
 
     if args.stats:
-        std_dir = os.path.join("experiments", "state_std")
+        std_dir = os.path.join("experiments", "state_std", run_id)
+        std_npy_dir = os.path.join(std_dir, "npy")
         state_std, state_l1, state_l2 = compute_state_stats_series(state_args)
         if len(state_args) > 0:
             entry_count = int(state_args[0][0].numel())
             print(f"State entry count per frame: {entry_count}")
         else:
             print("State entry count per frame: 0 (no state_args)")
-        std_path = os.path.join(std_dir, f"{seq_id}_state_std.npy")
-        l1_path = os.path.join(std_dir, f"{seq_id}_state_l1.npy")
-        l2_path = os.path.join(std_dir, f"{seq_id}_state_l2.npy")
-        plot_std_path = os.path.join(std_dir, f"{seq_id}_state_std.png")
-        plot_l1_path = os.path.join(std_dir, f"{seq_id}_state_l1.png")
-        plot_l2_path = os.path.join(std_dir, f"{seq_id}_state_l2.png")
+        std_path = os.path.join(std_npy_dir, f"{run_id}_state_std.npy")
+        l1_path = os.path.join(std_npy_dir, f"{run_id}_state_l1.npy")
+        l2_path = os.path.join(std_npy_dir, f"{run_id}_state_l2.npy")
+        plot_std_path = os.path.join(std_dir, f"{run_id}_state_std.png")
+        plot_l1_path = os.path.join(std_dir, f"{run_id}_state_l1.png")
+        plot_l2_path = os.path.join(std_dir, f"{run_id}_state_l2.png")
         os.makedirs(std_dir, exist_ok=True)
+        os.makedirs(std_npy_dir, exist_ok=True)
         np.save(std_path, state_std)
         np.save(l1_path, state_l1)
         np.save(l2_path, state_l2)
         save_state_plot(state_std, plot_std_path, seq_id, "State token std", "Std")
         save_state_plot(
-            state_l1, plot_l1_path, seq_id, "State token L1 norm", "L1 norm"
+            state_l1, plot_l1_path, seq_id, "State token L1 mean", "L1 mean"
         )
         save_state_plot(
-            state_l2, plot_l2_path, seq_id, "State token L2 norm", "L2 norm"
+            state_l2, plot_l2_path, seq_id, "State token L2 mean", "L2 mean"
         )
         print(f"Saved state std series to {std_path}")
         print(f"Saved state l1 series to {l1_path}")
@@ -586,36 +710,172 @@ def run_inference(args):
         print(f"Saved state l1 plot to {plot_l1_path}")
         print(f"Saved state l2 plot to {plot_l2_path}")
 
-        pose_dir = os.path.join("experiments", "state_pose")
-        mem_std, mem_l1, mem_l2 = compute_mem_stats_series(state_args)
+        pose_dir = os.path.join("experiments", "state_pose", run_id)
+        pose_npy_dir = os.path.join(pose_dir, "npy")
+        (
+            mem_std,
+            mem_l1,
+            mem_l2,
+            mem_front_std,
+            mem_front_l1,
+            mem_front_l2,
+            mem_back_std,
+            mem_back_l1,
+            mem_back_l2,
+        ) = compute_mem_stats_series(state_args)
         if len(state_args) > 0:
             mem_entry_count = int(state_args[0][3].numel())
             print(f"LocalMemory entry count per frame: {mem_entry_count}")
         else:
             print("LocalMemory entry count per frame: 0 (no state_args)")
-        mem_std_path = os.path.join(pose_dir, f"{seq_id}_mem_std.npy")
-        mem_l1_path = os.path.join(pose_dir, f"{seq_id}_mem_l1.npy")
-        mem_l2_path = os.path.join(pose_dir, f"{seq_id}_mem_l2.npy")
-        mem_plot_std = os.path.join(pose_dir, f"{seq_id}_mem_std.png")
-        mem_plot_l1 = os.path.join(pose_dir, f"{seq_id}_mem_l1.png")
-        mem_plot_l2 = os.path.join(pose_dir, f"{seq_id}_mem_l2.png")
+        mem_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_std.npy")
+        mem_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_l1.npy")
+        mem_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_l2.npy")
+        mem_plot_std = os.path.join(pose_dir, f"{run_id}_mem_std.png")
+        mem_plot_l1 = os.path.join(pose_dir, f"{run_id}_mem_l1.png")
+        mem_plot_l2 = os.path.join(pose_dir, f"{run_id}_mem_l2.png")
+        mem_front_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_std.npy")
+        mem_front_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_l1.npy")
+        mem_front_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_l2.npy")
+        mem_back_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_std.npy")
+        mem_back_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_l1.npy")
+        mem_back_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_l2.npy")
+        mem_plot_front_std = os.path.join(pose_dir, f"{run_id}_mem_front_std.png")
+        mem_plot_front_l1 = os.path.join(pose_dir, f"{run_id}_mem_front_l1.png")
+        mem_plot_front_l2 = os.path.join(pose_dir, f"{run_id}_mem_front_l2.png")
+        mem_plot_back_std = os.path.join(pose_dir, f"{run_id}_mem_back_std.png")
+        mem_plot_back_l1 = os.path.join(pose_dir, f"{run_id}_mem_back_l1.png")
+        mem_plot_back_l2 = os.path.join(pose_dir, f"{run_id}_mem_back_l2.png")
         os.makedirs(pose_dir, exist_ok=True)
+        os.makedirs(pose_npy_dir, exist_ok=True)
         np.save(mem_std_path, mem_std)
         np.save(mem_l1_path, mem_l1)
         np.save(mem_l2_path, mem_l2)
+        np.save(mem_front_std_path, mem_front_std)
+        np.save(mem_front_l1_path, mem_front_l1)
+        np.save(mem_front_l2_path, mem_front_l2)
+        np.save(mem_back_std_path, mem_back_std)
+        np.save(mem_back_l1_path, mem_back_l1)
+        np.save(mem_back_l2_path, mem_back_l2)
         save_state_plot(mem_std, mem_plot_std, seq_id, "LocalMemory std", "Std")
         save_state_plot(
-            mem_l1, mem_plot_l1, seq_id, "LocalMemory L1 norm", "L1 norm"
+            mem_l1, mem_plot_l1, seq_id, "LocalMemory L1 mean", "L1 mean"
         )
         save_state_plot(
-            mem_l2, mem_plot_l2, seq_id, "LocalMemory L2 norm", "L2 norm"
+            mem_l2, mem_plot_l2, seq_id, "LocalMemory L2 mean", "L2 mean"
+        )
+        save_state_plot(
+            mem_front_std,
+            mem_plot_front_std,
+            seq_id,
+            "LocalMemory front-half std",
+            "Std",
+        )
+        save_state_plot(
+            mem_front_l1,
+            mem_plot_front_l1,
+            seq_id,
+            "LocalMemory front-half L1 mean",
+            "L1 mean",
+        )
+        save_state_plot(
+            mem_front_l2,
+            mem_plot_front_l2,
+            seq_id,
+            "LocalMemory front-half L2 mean",
+            "L2 mean",
+        )
+        save_state_plot(
+            mem_back_std,
+            mem_plot_back_std,
+            seq_id,
+            "LocalMemory back-half std",
+            "Std",
+        )
+        save_state_plot(
+            mem_back_l1,
+            mem_plot_back_l1,
+            seq_id,
+            "LocalMemory back-half L1 mean",
+            "L1 mean",
+        )
+        save_state_plot(
+            mem_back_l2,
+            mem_plot_back_l2,
+            seq_id,
+            "LocalMemory back-half L2 mean",
+            "L2 mean",
         )
         print(f"Saved mem std series to {mem_std_path}")
         print(f"Saved mem l1 series to {mem_l1_path}")
         print(f"Saved mem l2 series to {mem_l2_path}")
+        print(f"Saved mem front-half std series to {mem_front_std_path}")
+        print(f"Saved mem front-half l1 series to {mem_front_l1_path}")
+        print(f"Saved mem front-half l2 series to {mem_front_l2_path}")
+        print(f"Saved mem back-half std series to {mem_back_std_path}")
+        print(f"Saved mem back-half l1 series to {mem_back_l1_path}")
+        print(f"Saved mem back-half l2 series to {mem_back_l2_path}")
         print(f"Saved mem std plot to {mem_plot_std}")
         print(f"Saved mem l1 plot to {mem_plot_l1}")
         print(f"Saved mem l2 plot to {mem_plot_l2}")
+        print(f"Saved mem front-half std plot to {mem_plot_front_std}")
+        print(f"Saved mem front-half l1 plot to {mem_plot_front_l1}")
+        print(f"Saved mem front-half l2 plot to {mem_plot_front_l2}")
+        print(f"Saved mem back-half std plot to {mem_plot_back_std}")
+        print(f"Saved mem back-half l1 plot to {mem_plot_back_l1}")
+        print(f"Saved mem back-half l2 plot to {mem_plot_back_l2}")
+
+        single_series = compute_single_state_token_series(
+            state_args, args.single_state_token_idx, args.single_state_stat
+        )
+        single_label = f"State token {args.single_state_token_idx} {args.single_state_stat}"
+        single_base = (
+            f"{run_id}_state_token{args.single_state_token_idx}_{args.single_state_stat}"
+        )
+        single_npy_path = os.path.join(std_npy_dir, f"{single_base}.npy")
+        single_plot_path = os.path.join(std_dir, f"{single_base}.png")
+        np.save(single_npy_path, single_series)
+        save_state_plot(
+            single_series,
+            single_plot_path,
+            seq_id,
+            single_label,
+            args.single_state_stat,
+        )
+        print(f"Saved single-token series to {single_npy_path}")
+        print(f"Saved single-token plot to {single_plot_path}")
+
+    if args.pca:
+        pca_dir = os.path.join("experiments", "state_pca", run_id)
+        pca_npy_dir = os.path.join(pca_dir, "npy")
+        os.makedirs(pca_dir, exist_ok=True)
+        os.makedirs(pca_npy_dir, exist_ok=True)
+        state_pca90 = compute_pca90_components_series(state_args, 0)
+        mem_pca90 = compute_pca90_components_series(state_args, 3)
+        state_pca_npy = os.path.join(pca_npy_dir, f"{run_id}_state_pca90.npy")
+        mem_pca_npy = os.path.join(pca_npy_dir, f"{run_id}_mem_pca90.npy")
+        state_pca_plot = os.path.join(pca_dir, f"{run_id}_state_pca90.png")
+        mem_pca_plot = os.path.join(pca_dir, f"{run_id}_mem_pca90.png")
+        np.save(state_pca_npy, state_pca90)
+        np.save(mem_pca_npy, mem_pca90)
+        save_state_plot(
+            state_pca90,
+            state_pca_plot,
+            seq_id,
+            "State PCA90 components",
+            "Components",
+        )
+        save_state_plot(
+            mem_pca90,
+            mem_pca_plot,
+            seq_id,
+            "LocalMemory PCA90 components",
+            "Components",
+        )
+        print(f"Saved state PCA90 series to {state_pca_npy}")
+        print(f"Saved LocalMemory PCA90 series to {mem_pca_npy}")
+        print(f"Saved state PCA90 plot to {state_pca_plot}")
+        print(f"Saved LocalMemory PCA90 plot to {mem_pca_plot}")
 
     if args.disable_vis:
         print("Visualization disabled; skipping point cloud viewer.")

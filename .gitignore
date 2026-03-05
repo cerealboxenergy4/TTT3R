@@ -57,5 +57,7 @@ src/checkpoints
 # Ignore results
 tmp
 eval_results
+demo_tmp/
+experiments/
 
 .vscode
