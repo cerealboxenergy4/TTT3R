@@ -29,6 +29,8 @@ import shutil
 from copy import deepcopy
 from add_ckpt_path import add_path_to_dust3r
 import imageio.v2 as iio
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from sklearn.decomposition import PCA
@@ -78,6 +80,13 @@ def parse_args():
         help="Visualization threshold for the point cloud viewer. Ranging from 1 to INF",
     )
     parser.add_argument(
+        "--no_vis",
+        "--disable_vis",
+        action="store_true",
+        dest="disable_vis",
+        help="Disable point cloud visualization and viewer launch.",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         default="./demo_tmp",
@@ -112,6 +121,11 @@ def parse_args():
         type=int,
         default=1,
         help="Downsample factor for the point cloud viewer",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Save state/memory statistics plots and arrays",
     )
     return parser.parse_args()
 
@@ -416,6 +430,64 @@ def parse_seq_path(p, frame_interval=1):
     return img_paths, tmpdirname
 
 
+def compute_state_stats_series(state_args):
+    std_values = []
+    l1_values = []
+    l2_values = []
+    for state_arg in state_args:
+        state_feat = state_arg[0]
+        flat = state_feat.detach().float().reshape(-1)
+        if flat.numel() == 0:
+            std_values.append(float("nan"))
+            l1_values.append(float("nan"))
+            l2_values.append(float("nan"))
+            continue
+        std_values.append(torch.std(flat, unbiased=False).item())
+        l1_values.append(torch.norm(flat, p=1).item())
+        l2_values.append(torch.norm(flat, p=2).item())
+    return (
+        np.array(std_values, dtype=np.float32),
+        np.array(l1_values, dtype=np.float32),
+        np.array(l2_values, dtype=np.float32),
+    )
+
+
+def compute_mem_stats_series(state_args):
+    std_values = []
+    l1_values = []
+    l2_values = []
+    for state_arg in state_args:
+        mem = state_arg[3]
+        flat = mem.detach().float().reshape(-1)
+        if flat.numel() == 0:
+            std_values.append(float("nan"))
+            l1_values.append(float("nan"))
+            l2_values.append(float("nan"))
+            continue
+        std_values.append(torch.std(flat, unbiased=False).item())
+        l1_values.append(torch.norm(flat, p=1).item())
+        l2_values.append(torch.norm(flat, p=2).item())
+    return (
+        np.array(std_values, dtype=np.float32),
+        np.array(l1_values, dtype=np.float32),
+        np.array(l2_values, dtype=np.float32),
+    )
+
+
+def save_state_plot(values, plot_path, seq_id, title_suffix, y_label):
+    os.makedirs(os.path.dirname(plot_path), exist_ok=True)
+    fig = plt.figure(figsize=(8, 4))
+    x = np.arange(len(values))
+    plt.plot(x, values, marker="o", linewidth=1.5)
+    plt.xlabel("Frame index (0 = init state)")
+    plt.ylabel(y_label)
+    plt.title(f"{title_suffix} over time ({seq_id})")
+    plt.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+
+
 def run_inference(args):
     """
     Execute the full inference and visualization pipeline.
@@ -435,7 +507,6 @@ def run_inference(args):
     # Import model and inference functions after adding the ckpt path.
     from src.dust3r.inference import inference, inference_recurrent, inference_recurrent_lighter
     from src.dust3r.model import ARCroco3DStereo
-    from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
     img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval)
@@ -461,7 +532,7 @@ def run_inference(args):
 
     # Load and prepare the model.
     print(f"Loading model from {args.model_path}...")
-    model = ARCroco3DStereo.from_pretrained(args.model_path).to(device)
+    model = ARCroco3DStereo.from_pretrained(args.model_path, weights_only=False).to(device)
     model.config.model_update_type = args.model_update_type
 
     model.eval()
@@ -478,6 +549,78 @@ def run_inference(args):
         f"Inference completed in {total_time:.2f} seconds (average {per_frame_time:.2f} s per frame), FPS: {FPS_num:.2f}."
     )
 
+    from pathlib import Path
+
+    seq = Path(args.seq_path)
+    seq_id = seq.stem if seq.suffix else seq.name
+
+    if args.stats:
+        std_dir = os.path.join("experiments", "state_std")
+        state_std, state_l1, state_l2 = compute_state_stats_series(state_args)
+        if len(state_args) > 0:
+            entry_count = int(state_args[0][0].numel())
+            print(f"State entry count per frame: {entry_count}")
+        else:
+            print("State entry count per frame: 0 (no state_args)")
+        std_path = os.path.join(std_dir, f"{seq_id}_state_std.npy")
+        l1_path = os.path.join(std_dir, f"{seq_id}_state_l1.npy")
+        l2_path = os.path.join(std_dir, f"{seq_id}_state_l2.npy")
+        plot_std_path = os.path.join(std_dir, f"{seq_id}_state_std.png")
+        plot_l1_path = os.path.join(std_dir, f"{seq_id}_state_l1.png")
+        plot_l2_path = os.path.join(std_dir, f"{seq_id}_state_l2.png")
+        os.makedirs(std_dir, exist_ok=True)
+        np.save(std_path, state_std)
+        np.save(l1_path, state_l1)
+        np.save(l2_path, state_l2)
+        save_state_plot(state_std, plot_std_path, seq_id, "State token std", "Std")
+        save_state_plot(
+            state_l1, plot_l1_path, seq_id, "State token L1 norm", "L1 norm"
+        )
+        save_state_plot(
+            state_l2, plot_l2_path, seq_id, "State token L2 norm", "L2 norm"
+        )
+        print(f"Saved state std series to {std_path}")
+        print(f"Saved state l1 series to {l1_path}")
+        print(f"Saved state l2 series to {l2_path}")
+        print(f"Saved state std plot to {plot_std_path}")
+        print(f"Saved state l1 plot to {plot_l1_path}")
+        print(f"Saved state l2 plot to {plot_l2_path}")
+
+        pose_dir = os.path.join("experiments", "state_pose")
+        mem_std, mem_l1, mem_l2 = compute_mem_stats_series(state_args)
+        if len(state_args) > 0:
+            mem_entry_count = int(state_args[0][3].numel())
+            print(f"LocalMemory entry count per frame: {mem_entry_count}")
+        else:
+            print("LocalMemory entry count per frame: 0 (no state_args)")
+        mem_std_path = os.path.join(pose_dir, f"{seq_id}_mem_std.npy")
+        mem_l1_path = os.path.join(pose_dir, f"{seq_id}_mem_l1.npy")
+        mem_l2_path = os.path.join(pose_dir, f"{seq_id}_mem_l2.npy")
+        mem_plot_std = os.path.join(pose_dir, f"{seq_id}_mem_std.png")
+        mem_plot_l1 = os.path.join(pose_dir, f"{seq_id}_mem_l1.png")
+        mem_plot_l2 = os.path.join(pose_dir, f"{seq_id}_mem_l2.png")
+        os.makedirs(pose_dir, exist_ok=True)
+        np.save(mem_std_path, mem_std)
+        np.save(mem_l1_path, mem_l1)
+        np.save(mem_l2_path, mem_l2)
+        save_state_plot(mem_std, mem_plot_std, seq_id, "LocalMemory std", "Std")
+        save_state_plot(
+            mem_l1, mem_plot_l1, seq_id, "LocalMemory L1 norm", "L1 norm"
+        )
+        save_state_plot(
+            mem_l2, mem_plot_l2, seq_id, "LocalMemory L2 norm", "L2 norm"
+        )
+        print(f"Saved mem std series to {mem_std_path}")
+        print(f"Saved mem l1 series to {mem_l1_path}")
+        print(f"Saved mem l2 series to {mem_l2_path}")
+        print(f"Saved mem std plot to {mem_plot_std}")
+        print(f"Saved mem l1 plot to {mem_plot_l1}")
+        print(f"Saved mem l2 plot to {mem_plot_l2}")
+
+    if args.disable_vis:
+        print("Visualization disabled; skipping point cloud viewer.")
+        return
+
     # Process outputs for visualization.
     print("Preparing output for visualization...")
     pts3ds_other, colors, conf, cam_dict = prepare_output(
@@ -491,6 +634,8 @@ def run_inference(args):
 
     # Create and run the point cloud viewer.
     print("Launching point cloud viewer...")
+    from viser_utils import PointCloudViewer
+
     viewer = PointCloudViewer(
         model,
         state_args,
