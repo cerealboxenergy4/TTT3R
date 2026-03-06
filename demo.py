@@ -56,6 +56,11 @@ def parse_args():
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
+        "--ckpt",
+        action="store_true",
+        help="Use /home/hunn/checkpoints/cut3r_512_dpt_4_64.pth as model path",
+    )
+    parser.add_argument(
         "--seq_path",
         type=str,
         default="",
@@ -148,6 +153,17 @@ def parse_args():
         type=int,
         default=50,
         help="Window size (in frames) for MMD reference and comparisons",
+    )
+    parser.add_argument(
+        "--mmd_mem",
+        action="store_true",
+        help="Compute MMD for LocalMemory with per-step normalization",
+    )
+    parser.add_argument(
+        "--mmd_mem_window",
+        type=int,
+        default=50,
+        help="Window size (in frames) for LocalMemory MMD",
     )
     parser.add_argument(
         "--single_state_token_idx",
@@ -609,14 +625,20 @@ def _rbf_kernel(x, y, sigma2):
     return torch.exp(-d2 / (2.0 * sigma2))
 
 
-def compute_mmd_series(state_args, window_size=50, max_samples=2048):
+def compute_mmd_series(state_args, window_size=50, max_samples=2048, tensor_index=0, normalize=False):
     per_frame = []
     for state_arg in state_args:
-        state_feat = state_arg[0]
-        if state_feat is None or state_feat.numel() == 0:
+        tensor = state_arg[tensor_index]
+        if tensor is None or tensor.numel() == 0:
             per_frame.append(None)
             continue
-        x = state_feat.detach().float().reshape(-1, state_feat.shape[-1])
+        x = tensor.detach().float()
+        if normalize:
+            mean = x.mean()
+            std = x.std(unbiased=False)
+            if std > 0:
+                x = (x - mean) / std
+        x = x.reshape(-1, x.shape[-1])
         per_frame.append(x)
 
     num_frames = len(per_frame)
@@ -728,6 +750,8 @@ def run_inference(args):
         shutil.rmtree(tmpdirname)
 
     # Load and prepare the model.
+    if args.ckpt:
+        args.model_path = "/home/hunn/checkpoints/cut3r_512_dpt_4_64.pth"
     print(f"Loading model from {args.model_path}...")
     model = ARCroco3DStereo.from_pretrained(args.model_path, weights_only=False).to(device)
     model.config.model_update_type = args.model_update_type
@@ -755,25 +779,17 @@ def run_inference(args):
     run_id = f"{base_id}_{timestamp}"
 
     if args.stats:
-        std_dir = os.path.join("experiments", "state_std", run_id)
-        std_npy_dir = os.path.join(std_dir, "npy")
+        std_dir = os.path.join("experiments", "state_std")
         state_std, state_l1, state_l2 = compute_state_stats_series(state_args)
         if len(state_args) > 0:
             entry_count = int(state_args[0][0].numel())
             print(f"State entry count per frame: {entry_count}")
         else:
             print("State entry count per frame: 0 (no state_args)")
-        std_path = os.path.join(std_npy_dir, f"{run_id}_state_std.npy")
-        l1_path = os.path.join(std_npy_dir, f"{run_id}_state_l1.npy")
-        l2_path = os.path.join(std_npy_dir, f"{run_id}_state_l2.npy")
         plot_std_path = os.path.join(std_dir, f"{run_id}_state_std.png")
         plot_l1_path = os.path.join(std_dir, f"{run_id}_state_l1.png")
         plot_l2_path = os.path.join(std_dir, f"{run_id}_state_l2.png")
         os.makedirs(std_dir, exist_ok=True)
-        os.makedirs(std_npy_dir, exist_ok=True)
-        np.save(std_path, state_std)
-        np.save(l1_path, state_l1)
-        np.save(l2_path, state_l2)
         save_state_plot(state_std, plot_std_path, seq_id, "State token std", "Std")
         save_state_plot(
             state_l1, plot_l1_path, seq_id, "State token L1 mean", "L1 mean"
@@ -781,15 +797,11 @@ def run_inference(args):
         save_state_plot(
             state_l2, plot_l2_path, seq_id, "State token L2 mean", "L2 mean"
         )
-        print(f"Saved state std series to {std_path}")
-        print(f"Saved state l1 series to {l1_path}")
-        print(f"Saved state l2 series to {l2_path}")
         print(f"Saved state std plot to {plot_std_path}")
         print(f"Saved state l1 plot to {plot_l1_path}")
         print(f"Saved state l2 plot to {plot_l2_path}")
 
-        pose_dir = os.path.join("experiments", "state_pose", run_id)
-        pose_npy_dir = os.path.join(pose_dir, "npy")
+        pose_dir = os.path.join("experiments", "state_pose")
         (
             mem_std,
             mem_l1,
@@ -806,18 +818,9 @@ def run_inference(args):
             print(f"LocalMemory entry count per frame: {mem_entry_count}")
         else:
             print("LocalMemory entry count per frame: 0 (no state_args)")
-        mem_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_std.npy")
-        mem_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_l1.npy")
-        mem_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_l2.npy")
         mem_plot_std = os.path.join(pose_dir, f"{run_id}_mem_std.png")
         mem_plot_l1 = os.path.join(pose_dir, f"{run_id}_mem_l1.png")
         mem_plot_l2 = os.path.join(pose_dir, f"{run_id}_mem_l2.png")
-        mem_front_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_std.npy")
-        mem_front_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_l1.npy")
-        mem_front_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_front_l2.npy")
-        mem_back_std_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_std.npy")
-        mem_back_l1_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_l1.npy")
-        mem_back_l2_path = os.path.join(pose_npy_dir, f"{run_id}_mem_back_l2.npy")
         mem_plot_front_std = os.path.join(pose_dir, f"{run_id}_mem_front_std.png")
         mem_plot_front_l1 = os.path.join(pose_dir, f"{run_id}_mem_front_l1.png")
         mem_plot_front_l2 = os.path.join(pose_dir, f"{run_id}_mem_front_l2.png")
@@ -825,16 +828,6 @@ def run_inference(args):
         mem_plot_back_l1 = os.path.join(pose_dir, f"{run_id}_mem_back_l1.png")
         mem_plot_back_l2 = os.path.join(pose_dir, f"{run_id}_mem_back_l2.png")
         os.makedirs(pose_dir, exist_ok=True)
-        os.makedirs(pose_npy_dir, exist_ok=True)
-        np.save(mem_std_path, mem_std)
-        np.save(mem_l1_path, mem_l1)
-        np.save(mem_l2_path, mem_l2)
-        np.save(mem_front_std_path, mem_front_std)
-        np.save(mem_front_l1_path, mem_front_l1)
-        np.save(mem_front_l2_path, mem_front_l2)
-        np.save(mem_back_std_path, mem_back_std)
-        np.save(mem_back_l1_path, mem_back_l1)
-        np.save(mem_back_l2_path, mem_back_l2)
         save_state_plot(mem_std, mem_plot_std, seq_id, "LocalMemory std", "Std")
         save_state_plot(
             mem_l1, mem_plot_l1, seq_id, "LocalMemory L1 mean", "L1 mean"
@@ -884,15 +877,6 @@ def run_inference(args):
             "LocalMemory back-half L2 mean",
             "L2 mean",
         )
-        print(f"Saved mem std series to {mem_std_path}")
-        print(f"Saved mem l1 series to {mem_l1_path}")
-        print(f"Saved mem l2 series to {mem_l2_path}")
-        print(f"Saved mem front-half std series to {mem_front_std_path}")
-        print(f"Saved mem front-half l1 series to {mem_front_l1_path}")
-        print(f"Saved mem front-half l2 series to {mem_front_l2_path}")
-        print(f"Saved mem back-half std series to {mem_back_std_path}")
-        print(f"Saved mem back-half l1 series to {mem_back_l1_path}")
-        print(f"Saved mem back-half l2 series to {mem_back_l2_path}")
         print(f"Saved mem std plot to {mem_plot_std}")
         print(f"Saved mem l1 plot to {mem_plot_l1}")
         print(f"Saved mem l2 plot to {mem_plot_l2}")
@@ -910,9 +894,7 @@ def run_inference(args):
         single_base = (
             f"{run_id}_state_token{args.single_state_token_idx}_{args.single_state_stat}"
         )
-        single_npy_path = os.path.join(std_npy_dir, f"{single_base}.npy")
         single_plot_path = os.path.join(std_dir, f"{single_base}.png")
-        np.save(single_npy_path, single_series)
         save_state_plot(
             single_series,
             single_plot_path,
@@ -920,22 +902,15 @@ def run_inference(args):
             single_label,
             args.single_state_stat,
         )
-        print(f"Saved single-token series to {single_npy_path}")
         print(f"Saved single-token plot to {single_plot_path}")
 
     if args.pca:
-        pca_dir = os.path.join("experiments", "state_pca", run_id)
-        pca_npy_dir = os.path.join(pca_dir, "npy")
+        pca_dir = os.path.join("experiments", "state_pca")
         os.makedirs(pca_dir, exist_ok=True)
-        os.makedirs(pca_npy_dir, exist_ok=True)
         state_pca90 = compute_pca90_components_series(state_args, 0)
         mem_pca90 = compute_pca90_components_series(state_args, 3)
-        state_pca_npy = os.path.join(pca_npy_dir, f"{run_id}_state_pca90.npy")
-        mem_pca_npy = os.path.join(pca_npy_dir, f"{run_id}_mem_pca90.npy")
         state_pca_plot = os.path.join(pca_dir, f"{run_id}_state_pca90.png")
         mem_pca_plot = os.path.join(pca_dir, f"{run_id}_mem_pca90.png")
-        np.save(state_pca_npy, state_pca90)
-        np.save(mem_pca_npy, mem_pca90)
         save_state_plot(
             state_pca90,
             state_pca_plot,
@@ -950,24 +925,18 @@ def run_inference(args):
             "LocalMemory PCA90 components",
             "Components",
         )
-        print(f"Saved state PCA90 series to {state_pca_npy}")
-        print(f"Saved LocalMemory PCA90 series to {mem_pca_npy}")
         print(f"Saved state PCA90 plot to {state_pca_plot}")
         print(f"Saved LocalMemory PCA90 plot to {mem_pca_plot}")
 
     if args.mmd:
-        mmd_dir = os.path.join("experiments", "state_mmd", run_id)
-        mmd_npy_dir = os.path.join(mmd_dir, "npy")
+        mmd_dir = os.path.join("experiments", "state_mmd")
         os.makedirs(mmd_dir, exist_ok=True)
-        os.makedirs(mmd_npy_dir, exist_ok=True)
-        mmd_series = compute_mmd_series(state_args, window_size=args.mmd_window)
-        mmd_npy = os.path.join(
-            mmd_npy_dir, f"{run_id}_state_mmd{args.mmd_window}.npy"
+        mmd_series = compute_mmd_series(
+            state_args, window_size=args.mmd_window, tensor_index=0, normalize=False
         )
         mmd_plot = os.path.join(
             mmd_dir, f"{run_id}_state_mmd{args.mmd_window}.png"
         )
-        np.save(mmd_npy, mmd_series)
         save_state_plot(
             mmd_series,
             mmd_plot,
@@ -975,8 +944,28 @@ def run_inference(args):
             f"State token MMD vs first window (window={args.mmd_window})",
             "MMD",
         )
-        print(f"Saved MMD series to {mmd_npy}")
         print(f"Saved MMD plot to {mmd_plot}")
+
+    if args.mmd_mem:
+        mmd_dir = os.path.join("experiments", "state_mmd_mem")
+        os.makedirs(mmd_dir, exist_ok=True)
+        mmd_series = compute_mmd_series(
+            state_args,
+            window_size=args.mmd_mem_window,
+            tensor_index=3,
+            normalize=True,
+        )
+        mmd_plot = os.path.join(
+            mmd_dir, f"{run_id}_mem_mmd{args.mmd_mem_window}_norm.png"
+        )
+        save_state_plot(
+            mmd_series,
+            mmd_plot,
+            run_id,
+            f"LocalMemory MMD vs first window (window={args.mmd_mem_window}, norm)",
+            "MMD",
+        )
+        print(f"Saved LocalMemory MMD plot to {mmd_plot}")
 
     if args.disable_vis:
         print("Visualization disabled; skipping point cloud viewer.")
