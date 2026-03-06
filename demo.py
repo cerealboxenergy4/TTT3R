@@ -139,6 +139,17 @@ def parse_args():
         help="Compute PCA90 component counts for state tokens and LocalMemory",
     )
     parser.add_argument(
+        "--mmd",
+        action="store_true",
+        help="Compute MMD between consecutive 50-frame state-token windows",
+    )
+    parser.add_argument(
+        "--mmd_window",
+        type=int,
+        default=50,
+        help="Window size (in frames) for MMD reference and comparisons",
+    )
+    parser.add_argument(
         "--single_state_token_idx",
         type=int,
         default=0,
@@ -593,6 +604,73 @@ def compute_pca90_components_series(state_args, tensor_index):
     return np.array(counts, dtype=np.float32)
 
 
+def _rbf_kernel(x, y, sigma2):
+    d2 = torch.cdist(x, y, p=2) ** 2
+    return torch.exp(-d2 / (2.0 * sigma2))
+
+
+def compute_mmd_series(state_args, window_size=50, max_samples=2048):
+    per_frame = []
+    for state_arg in state_args:
+        state_feat = state_arg[0]
+        if state_feat is None or state_feat.numel() == 0:
+            per_frame.append(None)
+            continue
+        x = state_feat.detach().float().reshape(-1, state_feat.shape[-1])
+        per_frame.append(x)
+
+    num_frames = len(per_frame)
+    num_windows = num_frames // window_size
+    if num_windows < 2:
+        return np.array([], dtype=np.float32)
+
+    def _collect_window(widx):
+        start = widx * window_size
+        end = start + window_size
+        xs = [t for t in per_frame[start:end] if t is not None and t.numel() > 0]
+        if not xs:
+            return None
+        x = torch.cat(xs, dim=0)
+        if x.shape[0] > max_samples:
+            idx = torch.randperm(x.shape[0])[:max_samples]
+            x = x[idx]
+        return x
+
+    ref = _collect_window(0)
+    if ref is None:
+        return np.array([float("nan")] * (num_windows - 1), dtype=np.float32)
+
+    mmd_values = []
+    for w in range(1, num_windows):
+        y = _collect_window(w)
+        if y is None:
+            mmd_values.append(float("nan"))
+            continue
+        z = torch.cat([ref, y], dim=0)
+        if z.shape[0] < 2:
+            mmd_values.append(float("nan"))
+            continue
+        z = z.cpu()
+        d2 = torch.cdist(z, z, p=2) ** 2
+        d2 = d2[d2 > 0]
+        if d2.numel() == 0:
+            mmd_values.append(float("nan"))
+            continue
+        sigma2 = torch.median(d2)
+        if sigma2 <= 0:
+            mmd_values.append(float("nan"))
+            continue
+        ref_cpu = ref.cpu()
+        y = y.cpu()
+        kxx = _rbf_kernel(ref_cpu, ref_cpu, sigma2).mean()
+        kyy = _rbf_kernel(y, y, sigma2).mean()
+        kxy = _rbf_kernel(ref_cpu, y, sigma2).mean()
+        mmd2 = kxx + kyy - 2 * kxy
+        mmd = torch.sqrt(torch.clamp(mmd2, min=0.0))
+        mmd_values.append(float(mmd.item()))
+    return np.array(mmd_values, dtype=np.float32)
+
+
 def save_state_plot(values, plot_path, seq_id, title_suffix, y_label):
     os.makedirs(os.path.dirname(plot_path), exist_ok=True)
     fig = plt.figure(figsize=(8, 4))
@@ -876,6 +954,29 @@ def run_inference(args):
         print(f"Saved LocalMemory PCA90 series to {mem_pca_npy}")
         print(f"Saved state PCA90 plot to {state_pca_plot}")
         print(f"Saved LocalMemory PCA90 plot to {mem_pca_plot}")
+
+    if args.mmd:
+        mmd_dir = os.path.join("experiments", "state_mmd", run_id)
+        mmd_npy_dir = os.path.join(mmd_dir, "npy")
+        os.makedirs(mmd_dir, exist_ok=True)
+        os.makedirs(mmd_npy_dir, exist_ok=True)
+        mmd_series = compute_mmd_series(state_args, window_size=args.mmd_window)
+        mmd_npy = os.path.join(
+            mmd_npy_dir, f"{run_id}_state_mmd{args.mmd_window}.npy"
+        )
+        mmd_plot = os.path.join(
+            mmd_dir, f"{run_id}_state_mmd{args.mmd_window}.png"
+        )
+        np.save(mmd_npy, mmd_series)
+        save_state_plot(
+            mmd_series,
+            mmd_plot,
+            run_id,
+            f"State token MMD vs first window (window={args.mmd_window})",
+            "MMD",
+        )
+        print(f"Saved MMD series to {mmd_npy}")
+        print(f"Saved MMD plot to {mmd_plot}")
 
     if args.disable_vis:
         print("Visualization disabled; skipping point cloud viewer.")
