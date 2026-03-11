@@ -33,6 +33,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from sklearn.decomposition import PCA
 import datetime
+import re
 from tqdm import tqdm
 from skimage.filters import threshold_otsu, threshold_multiotsu
 from einops import rearrange
@@ -50,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--model_path",
         type=str,
-        default="src/cut3r_512_dpt_4_64.pth",
+        default="/home/hunn/checkpoints/cut3r_512_dpt_4_64.pth",
         help="Path to the pretrained model checkpoint.",
     )
     parser.add_argument(
@@ -92,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--model_update_type",
         type=str,
-        default="cut3r",
+        default="ttt3r",
         help="model update type: cut3r or ttt3r",
     )
     parser.add_argument(
@@ -112,6 +113,12 @@ def parse_args():
         type=int,
         default=1,
         help="Downsample factor for the point cloud viewer",
+    )
+    parser.add_argument(
+        "--max_len",
+        type=int,
+        default=0,
+        help="Maximum number of input images/frames to load from the start; 0 means no limit",
     )
     return parser.parse_args()
 
@@ -366,11 +373,18 @@ def prepare_output(outputs, outdir, revisit=1, use_pose=True):
     # # convert_scene_output_to_glb(outdir, (colors_tosave * 255).to(torch.uint8), pts3ds_other_tosave, conf_other_tosave > 1, focal, cam2world_tosave, as_pointcloud=True)
     return pts3ds_other, colors, conf_other, cam_dict
 
-def parse_seq_path(p, frame_interval=1):
+def parse_seq_path(p, frame_interval=1, max_len=0):
     global framerate
     
     if os.path.isdir(p):
-        all_img_paths = sorted(glob.glob(f"{p}/*"))
+        def natural_sort_key(path):
+            name = os.path.basename(path)
+            return [
+                int(part) if part.isdigit() else part.lower()
+                for part in re.split(r"(\d+)", name)
+            ]
+
+        all_img_paths = sorted(glob.glob(f"{p}/*"), key=natural_sort_key)
         img_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
         img_paths = [path for path in all_img_paths 
                     if os.path.splitext(path.lower())[1] in img_extensions]
@@ -382,6 +396,9 @@ def parse_seq_path(p, frame_interval=1):
             img_paths = img_paths[::frame_interval]
             print(f" - Image sequence: Total images: {len(all_img_paths)}, "
                   f"Frame interval: {frame_interval}, Images to process: {len(img_paths)}")
+
+        if max_len > 0:
+            img_paths = img_paths[:max_len]
         
         framerate = 30.0 / frame_interval
         
@@ -399,6 +416,8 @@ def parse_seq_path(p, frame_interval=1):
         framerate = video_fps / frame_interval
         
         frame_indices = list(range(0, total_frames, frame_interval))
+        if max_len > 0:
+            frame_indices = frame_indices[:max_len]
         print(
             f" - Video FPS: {video_fps}, Frame Interval: {frame_interval}, Total Frames to Read: {len(frame_indices)}, Processed Framerate: {framerate}"
         )
@@ -438,7 +457,7 @@ def run_inference(args):
     from viser_utils import PointCloudViewer
 
     # Prepare image file paths.
-    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval)
+    img_paths, tmpdirname = parse_seq_path(args.seq_path, args.frame_interval, args.max_len)
     if not img_paths:
         print(f"No images found in {args.seq_path}. Please verify the path.")
         return
